@@ -64,6 +64,8 @@ Measured in headless Chromium on the software WebGL renderer (no GPU on the test
 | View | Candidates from the grid | Drawn | CPU time to prepare the frame |
 | --- | --- | --- | --- |
 | Whole circuit | 220,491 | 162,283 | 59 ms |
+
+In the whole-circuit view, 58,208 candidates are not drawn: at that zoom each is shorter than half a pixel, so the level-of-detail rule skips it. The count was checked against the file directly.
 | Zoomed in | 7,353 | 6,974 | 1.5 ms |
 
 Drawing speed on a real graphics card was not measured here.
