@@ -1,6 +1,4 @@
 #include "segment.h"
-Netlist* netlist_globale;
-SVGwriter img;
 Segment* initialize_segment(int NumRes, int p1, int p2, int HouV, int numSg){
   Segment* temp = (Segment*)malloc(sizeof(Segment));
   // s'il y a une erreur

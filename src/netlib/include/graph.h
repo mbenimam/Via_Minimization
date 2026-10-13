@@ -13,6 +13,7 @@
 // fonction de creation de graph
 Graph* init_graph(Netlist* nl);
 void methode_naiif(Graph* G, Netlist* nl);
+void afficher_graph(Netlist* nl, Graph* g, char* nomFichier);
 void bicolore(Graph* G);
 void detect_cycle(Graph* G);
 // fonction de viz
