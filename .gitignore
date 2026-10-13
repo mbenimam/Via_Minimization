@@ -1,0 +1,6 @@
+build/
+graphify-out/
+*.o
+*.d
+*.svg
+test_sauvegarde

@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>Netlist viewer (WebGL)</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0f1218; color: #d8dee9; font-family: system-ui, sans-serif; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: grab; }
+  canvas.dragging { cursor: grabbing; }
+  #panel { position: fixed; top: 10px; left: 10px; background: rgba(15,18,24,0.85); padding: 10px 12px; border-radius: 8px; font-size: 13px; line-height: 1.5; max-width: 320px; }
+  #panel h1 { font-size: 15px; margin: 0 0 6px; }
+  #panel button, #panel input[type=file] { font: inherit; margin: 2px 4px 2px 0; }
+  #stats { font-variant-numeric: tabular-nums; white-space: pre; margin-top: 6px; color: #9aa5b1; }
+  #drop { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,0.5); font-size: 22px; }
+  #drop.show { display: flex; }
+  #error { color: #ff8a80; margin-top: 6px; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="panel">
+  <h1>Netlist viewer</h1>
+  <div>
+    <input type="file" id="file" accept=".net,.txt">
+    <button id="fit">Fit</button>
+    <button id="color">Colour by net</button>
+  </div>
+  <div style="color:#9aa5b1">Drag to pan, wheel to zoom, drop a .net file anywhere.</div>
+  <div id="stats">loading…</div>
+  <div id="error"></div>
+</div>
+<div id="drop">Drop the .net file</div>
+
+<script>
+"use strict";
+
+// ---------- parsing the .net format ----------
+// first token: number of nets; then per net: id, nbPt, nbSeg;
+// nbPt lines "k x y" (point k), nbSeg lines "a b" (segment between points a and b).
+function parseNetlist(text) {
+  const tok = text.split(/\s+/).filter(t => t.length > 0);
+  let p = 0;
+  const nets = parseInt(tok[p++], 10);
+  const xs = [], ys = [], nets_of = [];
+  for (let r = 0; r < nets; r++) {
+    const id = parseInt(tok[p++], 10);
+    const nbPt = parseInt(tok[p++], 10);
+    const nbSeg = parseInt(tok[p++], 10);
+    const px = new Float64Array(nbPt), py = new Float64Array(nbPt);
+    for (let k = 0; k < nbPt; k++) {
+      const idx = parseInt(tok[p++], 10);
+      px[idx] = parseFloat(tok[p++]);
+      py[idx] = parseFloat(tok[p++]);
+    }
+    for (let s = 0; s < nbSeg; s++) {
+      const a = parseInt(tok[p++], 10), b = parseInt(tok[p++], 10);
+      xs.push(px[a], px[b]); ys.push(py[a], py[b]); nets_of.push(id);
+    }
+  }
+  const n = nets_of.length;
+  const seg = new Float32Array(n * 4);
+  for (let i = 0; i < n; i++) {
+    seg[4*i] = xs[2*i]; seg[4*i+1] = ys[2*i]; seg[4*i+2] = xs[2*i+1]; seg[4*i+3] = ys[2*i+1];
+  }
+  return { n, seg, net: Uint32Array.from(nets_of) };
+}
+
+// ---------- spatial grid for culling ----------
+// Each segment is stored in every grid cell its bounding box touches.
+// A viewport query only visits the cells it overlaps, then tests each candidate.
+function buildGrid(data) {
+  const { n, seg } = data;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (let i = 0; i < n; i++) {
+    const ax = seg[4*i], ay = seg[4*i+1], bx = seg[4*i+2], by = seg[4*i+3];
+    x0 = Math.min(x0, ax, bx); x1 = Math.max(x1, ax, bx);
+    y0 = Math.min(y0, ay, by); y1 = Math.max(y1, ay, by);
+  }
+  if (!isFinite(x0)) { x0 = y0 = 0; x1 = y1 = 1; }
+  const w = Math.max(x1 - x0, 1), h = Math.max(y1 - y0, 1);
+  const cells = Math.max(1, Math.ceil(Math.sqrt(n / 4)));
+  const cs = Math.max(w, h) / cells;
+  const nx = Math.max(1, Math.ceil(w / cs)), ny = Math.max(1, Math.ceil(h / cs));
+  const count = new Uint32Array(nx * ny + 1);
+  const range = new Uint32Array(n * 4);
+  const cellOf = (x, y) => [Math.min(nx - 1, Math.floor((x - x0) / cs)), Math.min(ny - 1, Math.floor((y - y0) / cs))];
+  for (let i = 0; i < n; i++) {
+    const [cx0, cy0] = cellOf(Math.min(seg[4*i], seg[4*i+2]), Math.min(seg[4*i+1], seg[4*i+3]));
+    const [cx1, cy1] = cellOf(Math.max(seg[4*i], seg[4*i+2]), Math.max(seg[4*i+1], seg[4*i+3]));
+    range[4*i] = cx0; range[4*i+1] = cy0; range[4*i+2] = cx1; range[4*i+3] = cy1;
+    for (let cy = cy0; cy <= cy1; cy++) for (let cx = cx0; cx <= cx1; cx++) count[cy*nx + cx + 1]++;
+  }
+  for (let c = 0; c < nx * ny; c++) count[c+1] += count[c];
+  const fill = count.slice(0, nx * ny);
+  const items = new Uint32Array(count[nx * ny]);
+  for (let i = 0; i < n; i++) {
+    for (let cy = range[4*i+1]; cy <= range[4*i+3]; cy++)
+      for (let cx = range[4*i]; cx <= range[4*i+2]; cx++)
+        items[fill[cy*nx + cx]++] = i;
+  }
+  return { x0, y0, x1, y1, nx, ny, cs, count, items, stamp: new Uint32Array(n), frame: 0 };
+}
+
+// ---------- WebGL ----------
+const canvas = document.getElementById('gl');
+const gl = canvas.getContext('webgl', { antialias: true, alpha: false, preserveDrawingBuffer: true });
+const VS = `
+attribute vec2 a_pos;
+attribute vec3 a_col;
+uniform vec2 u_scale;
+uniform vec2 u_off;
+varying vec3 v_col;
+void main() {
+  gl_Position = vec4(a_pos * u_scale + u_off, 0.0, 1.0);
+  v_col = a_col;
+}`;
+const FS = `
+precision mediump float;
+varying vec3 v_col;
+void main() { gl_FragColor = vec4(v_col, 1.0); }`;
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+  return sh;
+}
+let prog = null, buf = null, aPos = 0, aCol = 0, uScale = null, uOff = null;
+if (gl) {
+  prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(prog);
+  gl.useProgram(prog);
+  buf = gl.createBuffer();
+  aPos = gl.getAttribLocation(prog, 'a_pos');
+  aCol = gl.getAttribLocation(prog, 'a_col');
+  uScale = gl.getUniformLocation(prog, 'u_scale');
+  uOff = gl.getUniformLocation(prog, 'u_off');
+}
+
+// ---------- state ----------
+const st = {
+  data: null, grid: null,
+  view: { cx: 0, cy: 0, scale: 1 },   // world centre and pixels per world unit
+  colourByNet: true,
+  vertices: null,                     // interleaved x,y,r,g,b per vertex (2 per segment)
+  visible: 0, drawn: 0, frameMs: 0, fps: 0,
+  dirty: true,
+};
+const statsEl = document.getElementById('stats');
+const errEl = document.getElementById('error');
+
+function netColour(id) {
+  // a stable, well-spread hue per net, converted from HSV to RGB
+  const h = ((id * 137.508) % 360) / 60, c = 0.85, x = c * (1 - Math.abs(h % 2 - 1)), m = 0.15;
+  const [r, g, b] = h < 1 ? [c, x, 0] : h < 2 ? [x, c, 0] : h < 3 ? [0, c, x] : h < 4 ? [0, x, c] : h < 5 ? [x, 0, c] : [c, 0, x];
+  return [r + m, g + m, b + m];
+}
+function segColour(i) {
+  if (st.colourByNet) return netColour(st.data.net[i]);
+  return [0.55, 0.85, 1.0];
+}
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.floor(canvas.clientWidth * dpr);
+  canvas.height = Math.floor(canvas.clientHeight * dpr);
+  if (gl) gl.viewport(0, 0, canvas.width, canvas.height);
+  st.dirty = true;
+}
+
+function fit() {
+  if (!st.grid) return;
+  const g = st.grid;
+  const w = g.x1 - g.x0 || 1, h = g.y1 - g.y0 || 1;
+  const s = Math.min(canvas.clientWidth / w, canvas.clientHeight / h) * 0.95;
+  st.view = { cx: (g.x0 + g.x1) / 2, cy: (g.y0 + g.y1) / 2, scale: s };
+  st.dirty = true;
+}
+
+// ---------- culling + upload ----------
+// Visible world rectangle for the current view.
+function viewRect() {
+  const { cx, cy, scale } = st.view;
+  const hw = canvas.clientWidth / 2 / scale, hh = canvas.clientHeight / 2 / scale;
+  return { x0: cx - hw, x1: cx + hw, y0: cy - hh, y1: cy + hh };
+}
+
+function collectVisible() {
+  const g = st.grid, d = st.data, s = st.view.scale;
+  const v = viewRect();
+  const out = [];
+  let candidates = 0;
+  g.frame++;
+  const ix0 = Math.max(0, Math.floor((v.x0 - g.x0) / g.cs)), ix1 = Math.min(g.nx - 1, Math.floor((v.x1 - g.x0) / g.cs));
+  const iy0 = Math.max(0, Math.floor((v.y0 - g.y0) / g.cs)), iy1 = Math.min(g.ny - 1, Math.floor((v.y1 - g.y0) / g.cs));
+  for (let cy = iy0; cy <= iy1; cy++) {
+    for (let cx = ix0; cx <= ix1; cx++) {
+      const c = cy * g.nx + cx;
+      for (let k = g.count[c]; k < g.count[c + 1]; k++) {
+        const i = g.items[k];
+        if (g.stamp[i] === g.frame) continue;
+        g.stamp[i] = g.frame;
+        candidates++;
+        const ax = d.seg[4*i], ay = d.seg[4*i+1], bx = d.seg[4*i+2], by = d.seg[4*i+3];
+        // exact viewport test
+        if (Math.max(ax, bx) < v.x0 || Math.min(ax, bx) > v.x1 || Math.max(ay, by) < v.y0 || Math.min(ay, by) > v.y1) continue;
+        // too small to see at this zoom: skip (level of detail)
+        if (Math.max(Math.abs(bx - ax), Math.abs(by - ay)) * s < 0.5) continue;
+        out.push(i);
+      }
+    }
+  }
+  return { list: out, candidates };
+}
+
+function render() {
+  if (!gl || !st.data) return;
+  const t0 = performance.now();
+  const { list, candidates } = collectVisible();
+  const d = st.data;
+  const n = list.length;
+  if (!st.vertices || st.vertices.length < n * 10) st.vertices = new Float32Array(Math.max(n * 10, 10));
+  const V = st.vertices;
+  for (let j = 0; j < n; j++) {
+    const i = list[j];
+    const c = segColour(i);
+    const o = j * 10;
+    V[o] = d.seg[4*i];     V[o+1] = d.seg[4*i+1]; V[o+2] = c[0]; V[o+3] = c[1]; V[o+4] = c[2];
+    V[o+5] = d.seg[4*i+2]; V[o+6] = d.seg[4*i+3]; V[o+7] = c[0]; V[o+8] = c[1]; V[o+9] = c[2];
+  }
+  const { cx, cy, scale } = st.view;
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  gl.clearColor(0.06, 0.07, 0.09, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, V.subarray(0, n * 10), gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(aPos);
+  gl.enableVertexAttribArray(aCol);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 20, 0);
+  gl.vertexAttribPointer(aCol, 3, gl.FLOAT, false, 20, 8);
+  gl.uniform2f(uScale, 2 * scale / W, -2 * scale / H);
+  gl.uniform2f(uOff, -cx * 2 * scale / W, cy * 2 * scale / H);
+  gl.drawArrays(gl.LINES, 0, n * 2);
+  st.visible = n; st.candidates = candidates;
+  st.frameMs = performance.now() - t0;
+}
+
+// ---------- loop and stats ----------
+let lastFrame = performance.now(), frames = 0, fpsAt = performance.now();
+function loop() {
+  if (st.dirty) { render(); st.dirty = false; }
+  frames++;
+  const now = performance.now();
+  if (now - fpsAt > 500) { st.fps = frames * 1000 / (now - fpsAt); frames = 0; fpsAt = now; }
+  if (st.data) {
+    statsEl.textContent =
+      `segments: ${st.data.n.toLocaleString()}\n` +
+      `visible:  ${st.visible.toLocaleString()} (candidates ${st.candidates.toLocaleString()})\n` +
+      `frame:    ${st.frameMs.toFixed(1)} ms cpu prep, ${st.fps.toFixed(0)} fps\n` +
+      `zoom:     ${st.view.scale.toExponential(2)} px/unit`;
+  }
+  requestAnimationFrame(loop);
+}
+
+// ---------- loading ----------
+function load(text, name) {
+  try {
+    errEl.textContent = '';
+    const t0 = performance.now();
+    st.data = parseNetlist(text);
+    st.grid = buildGrid(st.data);
+    fit();
+    statsEl.textContent = `${name}: ${st.data.n.toLocaleString()} segments, indexed in ${(performance.now() - t0).toFixed(0)} ms`;
+  } catch (e) {
+    errEl.textContent = 'Could not read the file: ' + e.message;
+  }
+}
+
+// ---------- interaction ----------
+let drag = null;
+canvas.addEventListener('mousedown', e => { drag = { x: e.clientX, y: e.clientY }; canvas.classList.add('dragging'); });
+window.addEventListener('mouseup', () => { drag = null; canvas.classList.remove('dragging'); });
+window.addEventListener('mousemove', e => {
+  if (!drag) return;
+  st.view.cx -= (e.clientX - drag.x) / st.view.scale;
+  st.view.cy -= (e.clientY - drag.y) / st.view.scale;
+  drag = { x: e.clientX, y: e.clientY };
+  st.dirty = true;
+});
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  const f = Math.exp(-e.deltaY * 0.0015);
+  const mx = e.clientX - canvas.clientWidth / 2, my = e.clientY - canvas.clientHeight / 2;
+  const wx = st.view.cx + mx / st.view.scale, wy = st.view.cy + my / st.view.scale;
+  st.view.scale *= f;
+  st.view.cx = wx - mx / st.view.scale;
+  st.view.cy = wy - my / st.view.scale;
+  st.dirty = true;
+}, { passive: false });
+document.getElementById('fit').onclick = fit;
+document.getElementById('color').onclick = () => { st.colourByNet = !st.colourByNet; st.dirty = true; };
+document.getElementById('file').onchange = e => {
+  const f = e.target.files[0]; if (!f) return;
+  f.text().then(t => load(t, f.name));
+};
+window.addEventListener('dragover', e => { e.preventDefault(); document.getElementById('drop').classList.add('show'); });
+window.addEventListener('dragleave', () => document.getElementById('drop').classList.remove('show'));
+window.addEventListener('drop', e => {
+  e.preventDefault();
+  document.getElementById('drop').classList.remove('show');
+  const f = e.dataTransfer.files[0]; if (f) f.text().then(t => load(t, f.name));
+});
+window.addEventListener('resize', resize);
+
+// ---------- start ----------
+if (!gl) {
+  errEl.textContent = 'WebGL is not available in this browser.';
+} else {
+  resize();
+  const src = new URLSearchParams(location.search).get('file');
+  if (src) fetch(src).then(r => { if (!r.ok) throw new Error(r.status + ' ' + r.statusText); return r.text(); })
+                     .then(t => load(t, src)).catch(e => { errEl.textContent = 'Could not load ' + src + ': ' + e.message; });
+  else statsEl.textContent = 'Open a .net file to start.';
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>

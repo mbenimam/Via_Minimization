@@ -86,7 +86,7 @@ FILE *f ;
 double GetReel(f)
 FILE *f;
 {
-  char c, ReadChar();
+  char c;
   int v,v1,puiss,i, sign;
   double nbr;
   int entrer;

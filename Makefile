@@ -1,4 +1,4 @@
-EXEC= VisuNetlist tests_elementaires test_echeancier test_arbre test_graph
+EXEC= VisuNetlist tests_elementaires test_echeancier test_arbre test_graph test_crossings
 
 CFLAGS= -Wall -g
 SRC_PATH = src
@@ -23,13 +23,16 @@ INCLUDES = -I src/netlib/include
 all: dirs netlib $(EXEC_BIN)
 
 
-.PHONY: dirs
+.PHONY: check dirs
 dirs:
 	@echo "Creating directories"
 	@mkdir -p $(dir $(OBJECTS))
 	@mkdir -p $(BIN_PATH)
 
 .PHONY: clean
+check: all
+	./build/bin/test_crossings
+
 clean:
 	@echo "Deleting $(BIN_NAME) symlink"
 	@$(RM) $(BIN_NAME)

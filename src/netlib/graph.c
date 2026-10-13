@@ -1,5 +1,4 @@
 #include "graph.h"
-SVGwriter img;
 // fonction de creation de graph
 Graph* init_graph(Netlist* nl){
   // on assume que la netlist est complette
